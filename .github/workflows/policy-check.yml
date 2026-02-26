@@ -1,0 +1,207 @@
+name: Policy Check
+
+on:
+  pull_request:
+    branches: [main, develop, "release/**"]
+    types: [opened, synchronize, reopened]
+
+jobs:
+  policy-check:
+    name: OPA Policy Check
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup OPA
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          version: latest
+
+      - name: Get changed files
+        id: files
+        run: |
+          git diff --name-only --diff-filter=ACM origin/${{ github.base_ref }}...HEAD > /tmp/changed_files.txt
+          echo "Changed files:"
+          cat /tmp/changed_files.txt
+
+      - name: Create inline policy
+        run: |
+          mkdir -p /tmp/policies
+          cat > /tmp/policies/no_hardcoded_secrets.rego << 'REGO'
+          package policy.no_hardcoded_secrets
+
+          import rego.v1
+
+          api_key_prefixes := ["sk-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "AKIA", "xoxb-", "xoxp-"]
+          credential_names := ["password", "passwd", "secret", "token", "api_key", "apikey", "access_key", "private_key"]
+          connection_patterns := ["mongodb://", "postgres://", "mysql://", "redis://", "amqp://"]
+
+          violations contains violation if {
+            lines := split(input.content, "\n")
+            line := lines[i]
+            prefix := api_key_prefixes[_]
+            contains(line, prefix)
+            trimmed := trim_space(line)
+            not startswith(trimmed, "#")
+            not startswith(trimmed, "//")
+            not startswith(trimmed, "<!--")
+            violation := {
+              "policy_id": "no-hardcoded-secrets",
+              "rule": sprintf("API key pattern '%s' detected", [prefix]),
+              "severity": "critical",
+              "blocking": true,
+              "description": sprintf("Line %d contains a hardcoded API key (prefix: %s)", [i + 1, prefix]),
+            }
+          }
+
+          violations contains violation if {
+            lines := split(input.content, "\n")
+            line := lines[i]
+            lower_line := lower(line)
+            cred_name := credential_names[_]
+            contains(lower_line, cred_name)
+            regex.match(`(?i)[\w]*(?:password|passwd|secret|token|api_key|apikey|access_key|private_key)[\w]*\s*[=:]\s*["'][^"']+["']`, line)
+            not regex.match(`(?i)os\.(?:getenv|environ)`, line)
+            not contains(line, "${")
+            not contains(line, "${{")
+            trimmed := trim_space(line)
+            not startswith(trimmed, "#")
+            not startswith(trimmed, "//")
+            violation := {
+              "policy_id": "no-hardcoded-secrets",
+              "rule": sprintf("Hardcoded credential '%s' detected", [cred_name]),
+              "severity": "critical",
+              "blocking": true,
+              "description": sprintf("Line %d contains a hardcoded value for credential variable '%s'", [i + 1, cred_name]),
+            }
+          }
+
+          violations contains violation if {
+            lines := split(input.content, "\n")
+            line := lines[i]
+            pattern := connection_patterns[_]
+            contains(line, pattern)
+            regex.match(`://[^/\s]+:[^/\s]+@`, line)
+            trimmed := trim_space(line)
+            not startswith(trimmed, "#")
+            not startswith(trimmed, "//")
+            violation := {
+              "policy_id": "no-hardcoded-secrets",
+              "rule": "Connection string with embedded credentials detected",
+              "severity": "critical",
+              "blocking": true,
+              "description": sprintf("Line %d contains a connection string with embedded credentials", [i + 1]),
+            }
+          }
+          REGO
+
+      - name: Run policy checks
+        run: |
+          CHANGED_FILES="/tmp/changed_files.txt"
+          POLICY_DIR="/tmp/policies"
+          BLOCKED=0
+          WARNED=0
+          PASSED=0
+          SCANNED=0
+
+          echo ""
+          echo "OPA Policy Check"
+          echo "================================"
+
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+
+            # Only scan code/config files
+            case "$file" in
+              *.py|*.js|*.ts|*.jsx|*.tsx|*.yml|*.yaml|*.json|*.toml|*.cfg|*.ini|*.env|*.env.*)
+                ;;
+              *)
+                continue
+                ;;
+            esac
+
+            [ ! -f "$file" ] && continue
+            SCANNED=$((SCANNED + 1))
+
+            # Determine content type
+            content_type="code"
+            case "$file" in
+              .github/workflows/*.yml|.github/workflows/*.yaml)
+                content_type="workflow"
+                ;;
+            esac
+
+            # Build OPA input
+            python3 -c "
+          import json, sys
+          content = open(sys.argv[1]).read()
+          print(json.dumps({'content': content, 'content_type': sys.argv[2], 'context': {'file_path': sys.argv[1]}}))
+          " "$file" "$content_type" > /tmp/opa_input.json
+
+            # Run OPA
+            violations=$(opa eval -d "$POLICY_DIR" -i /tmp/opa_input.json -f json \
+              'data.policy.no_hardcoded_secrets.violations' 2>/dev/null \
+              | python3 -c "
+          import json, sys
+          try:
+              data = json.loads(sys.stdin.read())
+              vs = data.get('result',[{}])[0].get('expressions',[{}])[0].get('value',[])
+              for v in vs:
+                  sev = v.get('severity','unknown').upper()
+                  pid = v.get('policy_id','unknown')
+                  desc = v.get('description','')
+                  blk = v.get('blocking', False)
+                  print(f'{sev}|{pid}|{desc}|{blk}')
+          except Exception:
+              pass
+          " 2>/dev/null) || true
+
+            if [ -n "$violations" ]; then
+              has_blocking=false
+              while IFS='|' read -r sev pid desc blk; do
+                [ -z "$sev" ] && continue
+                if [ "$blk" = "True" ]; then
+                  has_blocking=true
+                fi
+              done <<< "$violations"
+
+              if [ "$has_blocking" = true ]; then
+                echo "  BLOCK   $file"
+                BLOCKED=$((BLOCKED + 1))
+              else
+                echo "  WARN    $file"
+                WARNED=$((WARNED + 1))
+              fi
+
+              while IFS='|' read -r sev pid desc blk; do
+                [ -z "$sev" ] && continue
+                echo "    $sev  $pid: $desc"
+              done <<< "$violations"
+            else
+              echo "  PASS    $file"
+              PASSED=$((PASSED + 1))
+            fi
+
+          done < "$CHANGED_FILES"
+
+          if [ "$SCANNED" -eq 0 ]; then
+            echo "No scannable files changed."
+            exit 0
+          fi
+
+          echo ""
+          echo "--------------------------------"
+          echo "  Passed: $PASSED  |  Warned: $WARNED  |  Blocked: $BLOCKED"
+          echo "--------------------------------"
+          echo ""
+
+          if [ "$BLOCKED" -gt 0 ]; then
+            echo "FAILED - $BLOCKED file(s) have blocking policy violations."
+            exit 1
+          fi
+
+          exit 0
