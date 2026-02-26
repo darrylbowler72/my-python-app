@@ -99,6 +99,38 @@ jobs:
           }
           REGO
 
+          # EICAR antivirus test string detection (split to avoid triggering AV)
+          cat > /tmp/policies/no_eicar_test_string.rego << 'REGO'
+          package policy.no_eicar_test_string
+
+          import rego.v1
+
+          eicar_prefix := "X5O!P%@AP[4\\PZX54(P^)7CC)7}"
+          eicar_suffix := "EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+
+          violations contains violation if {
+            contains(input.content, eicar_prefix)
+            violation := {
+              "policy_id": "no-eicar-test-string",
+              "rule": "EICAR antivirus test string detected",
+              "severity": "critical",
+              "blocking": true,
+              "description": "File contains the EICAR standard antivirus test string. Remove it before committing.",
+            }
+          }
+
+          violations contains violation if {
+            contains(input.content, eicar_suffix)
+            violation := {
+              "policy_id": "no-eicar-test-string",
+              "rule": "EICAR antivirus test string detected",
+              "severity": "critical",
+              "blocking": true,
+              "description": "File contains the EICAR standard antivirus test string signature. Remove it before committing.",
+            }
+          }
+          REGO
+
       - name: Run policy checks
         run: |
           CHANGED_FILES="/tmp/changed_files.txt"
@@ -107,6 +139,32 @@ jobs:
           WARNED=0
           PASSED=0
           SCANNED=0
+
+          # Evaluate a single policy package against an input file
+          eval_policy() {
+            local input_file="$1"
+            local package="$2"
+            local query="data.policy.${package}.violations"
+            local opa_output
+            opa_output=$(opa eval -d "$POLICY_DIR" -i "$input_file" -f json "$query" 2>/dev/null) || {
+              echo ""
+              return
+            }
+            python3 -c "
+          import json, sys
+          try:
+              data = json.loads(sys.stdin.read())
+              vs = data.get('result',[{}])[0].get('expressions',[{}])[0].get('value',[])
+              for v in vs:
+                  sev = v.get('severity','unknown').upper()
+                  pid = v.get('policy_id','unknown')
+                  desc = v.get('description','')
+                  blk = v.get('blocking', False)
+                  print(f'{sev}|{pid}|{desc}|{blk}')
+          except Exception:
+              pass
+          " <<< "$opa_output" 2>/dev/null
+          }
 
           echo ""
           echo "OPA Policy Check"
@@ -127,8 +185,9 @@ jobs:
             [ ! -f "$file" ] && continue
             SCANNED=$((SCANNED + 1))
 
-            # Determine content type
+            # Determine content type and policy packages
             content_type="code"
+            packages="no_hardcoded_secrets no_eicar_test_string"
             case "$file" in
               .github/workflows/*.yml|.github/workflows/*.yaml)
                 content_type="workflow"
@@ -142,32 +201,23 @@ jobs:
           print(json.dumps({'content': content, 'content_type': sys.argv[2], 'context': {'file_path': sys.argv[1]}}))
           " "$file" "$content_type" > /tmp/opa_input.json
 
-            # Run OPA
-            violations=$(opa eval -d "$POLICY_DIR" -i /tmp/opa_input.json -f json \
-              'data.policy.no_hardcoded_secrets.violations' 2>/dev/null \
-              | python3 -c "
-          import json, sys
-          try:
-              data = json.loads(sys.stdin.read())
-              vs = data.get('result',[{}])[0].get('expressions',[{}])[0].get('value',[])
-              for v in vs:
-                  sev = v.get('severity','unknown').upper()
-                  pid = v.get('policy_id','unknown')
-                  desc = v.get('description','')
-                  blk = v.get('blocking', False)
-                  print(f'{sev}|{pid}|{desc}|{blk}')
-          except Exception:
-              pass
-          " 2>/dev/null) || true
+            # Evaluate all policy packages
+            all_violations=""
+            for pkg in $packages; do
+              result=$(eval_policy /tmp/opa_input.json "$pkg")
+              if [ -n "$result" ]; then
+                all_violations="${all_violations}${result}"$'\n'
+              fi
+            done
 
-            if [ -n "$violations" ]; then
+            if [ -n "$all_violations" ]; then
               has_blocking=false
               while IFS='|' read -r sev pid desc blk; do
                 [ -z "$sev" ] && continue
                 if [ "$blk" = "True" ]; then
                   has_blocking=true
                 fi
-              done <<< "$violations"
+              done <<< "$all_violations"
 
               if [ "$has_blocking" = true ]; then
                 echo "  BLOCK   $file"
@@ -180,7 +230,7 @@ jobs:
               while IFS='|' read -r sev pid desc blk; do
                 [ -z "$sev" ] && continue
                 echo "    $sev  $pid: $desc"
-              done <<< "$violations"
+              done <<< "$all_violations"
             else
               echo "  PASS    $file"
               PASSED=$((PASSED + 1))
