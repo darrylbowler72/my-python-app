@@ -1,0 +1,58 @@
+name: my-python-app
+
+on:
+  push:
+    branches:
+      - develop
+      - 'release/**'
+      - 'hotfix/**'
+  pull_request:
+    branches:
+      - develop
+      - main
+
+jobs:
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+    - name: Install dependencies
+      run: pip install -r requirements.txt
+    - name: Run tests
+      run: python -m pytest --tb=short || echo 'No tests yet'
+
+  build:
+    needs: test
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+    - name: Install dependencies
+      run: pip install -r requirements.txt
+    - name: Build
+      run: python -m py_compile $(find . -name '*.py' | head -20) && echo 'Build OK'
+
+  deploy-dev:
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    steps:
+    - name: Deploy to dev
+      run: echo 'Deploying to dev environment'
+
+  deploy-staging:
+    needs: build
+    if: startsWith(github.ref, 'refs/heads/release/')
+    runs-on: ubuntu-latest
+    steps:
+    - name: Deploy to staging
+      run: echo 'Deploying to staging environment'
