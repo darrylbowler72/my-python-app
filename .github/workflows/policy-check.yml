@@ -67,7 +67,7 @@ jobs:
             regex.match(`(?i)[\w]*(?:password|passwd|secret|token|api_key|apikey|access_key|private_key)[\w]*\s*[=:]\s*["'][^"']+["']`, line)
             not regex.match(`(?i)os\.(?:getenv|environ)`, line)
             not contains(line, "${")
-            not contains(line, "${{")
+            not contains(line, "${{ '${{' }}")
             trimmed := trim_space(line)
             not startswith(trimmed, "#")
             not startswith(trimmed, "//")
