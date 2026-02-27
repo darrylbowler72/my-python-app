@@ -176,11 +176,9 @@ jobs:
             # Skip self — inline Rego contains API key prefixes that trigger false positives
             [ "$file" = ".github/workflows/policy-check.yml" ] && continue
 
-            # Only scan code/config files
+            # Skip known binary files, scan everything else
             case "$file" in
-              *.py|*.js|*.ts|*.jsx|*.tsx|*.yml|*.yaml|*.json|*.toml|*.cfg|*.ini|*.env|*.env.*)
-                ;;
-              *)
+              *.png|*.jpg|*.jpeg|*.gif|*.ico|*.svg|*.bmp|*.webp|*.mp4|*.mp3|*.wav|*.avi|*.mov|*.zip|*.tar|*.gz|*.bz2|*.xz|*.7z|*.rar|*.jar|*.war|*.ear|*.whl|*.pyc|*.pyo|*.class|*.o|*.so|*.dll|*.dylib|*.exe|*.bin|*.dat|*.db|*.sqlite|*.lock|*.woff|*.woff2|*.ttf|*.eot|*.pdf|*.doc|*.docx|*.xls|*.xlsx|*.ppt|*.pptx)
                 continue
                 ;;
             esac
