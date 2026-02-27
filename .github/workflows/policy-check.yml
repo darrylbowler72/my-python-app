@@ -173,6 +173,9 @@ jobs:
           while IFS= read -r file; do
             [ -z "$file" ] && continue
 
+            # Skip self — inline Rego contains API key prefixes that trigger false positives
+            [ "$file" = ".github/workflows/policy-check.yml" ] && continue
+
             # Only scan code/config files
             case "$file" in
               *.py|*.js|*.ts|*.jsx|*.tsx|*.yml|*.yaml|*.json|*.toml|*.cfg|*.ini|*.env|*.env.*)
